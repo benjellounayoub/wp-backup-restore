@@ -1,3 +1,18 @@
-backup/*
-.idea
-*.DS_Store
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# JetBrains / IntelliJ / PhpStorm / PyCharm project settings
+.idea/
+
+# VSCode (optional, remove if you want to include settings)
+.vscode/
+
+# Backup files
+*~
+*.swp
+
+# Logs & temp files
+*.log
+*.tmp
