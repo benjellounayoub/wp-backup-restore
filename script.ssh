@@ -1,5 +1,5 @@
 #!/bin/bash
-# WordPress multi-project BACKUP & RESTORE with logging
+# WordPress multi-project BACKUP & RESTORE with logging + retention + php-fpm restart
 # Backups:
 #   Files -> /var/www/save/<domain>/<YYYY-MM-DD>/<TS>_files.tar.gz
 #   DB    -> /var/www/save/<domain>/<YYYY-MM-DD>/db_<TS>.sql.gz
@@ -7,7 +7,12 @@
 # Logs:
 #   /var/log/wp-backup/run_<timestamp>.log  (+ latest.log symlink)
 #
-# Requirements: Debian/Ubuntu-like (nginx, mariadb/mysql, gzip, tar, find, tee)
+# Retention:
+#   - Backups older than BACKUP_RETENTION_DAYS are removed per domain
+#   - Logs older than LOG_RETENTION_DAYS are removed
+#
+# Requirements: Debian/Ubuntu-like (nginx, mariadb/mysql, gzip, tar, tee)
+# NOTE: Run as root (sudo). The script prompts securely for DB passwords on dump/restore.
 
 set -Euo pipefail
 
@@ -23,6 +28,10 @@ SAVE_BASE="/var/www/save"
 NGINX_BASE="/etc/nginx/sites-available"
 LOG_DIR="/var/log/wp-backup"
 WEB_OWNERSHIP="www-data:www-data"   # adjust if needed (e.g., nginx:nginx)
+
+# Retention (days)
+BACKUP_RETENTION_DAYS=30
+LOG_RETENTION_DAYS=30
 
 RUN_TS="$(date +%Y%m%d%H%M%S)"
 DATE_DIR="$(date +%Y-%m-%d)"
@@ -73,6 +82,61 @@ get_db_creds() {
     read -rp "[${DOMAIN}] Couldn't detect DB_USER. Enter DB user: " DB_USER
   fi
   info "[${DOMAIN}] DB_USER=${DB_USER} DB_NAME=${DB_NAME}"
+}
+
+detect_php_fpm_service() {
+  # Try to find an active php-fpm service (php8.3-fpm, php8.2-fpm, php7.4-fpm, php-fpm, etc.)
+  local svc=""
+  svc="$(systemctl list-units --type=service --state=running | awk '/php.*-fpm\.service/ {print $1; exit}')" || true
+  if [[ -z "$svc" ]]; then
+    svc="$(systemctl list-unit-files | awk '/php.*-fpm\.service/ {print $1; exit}')" || true
+  fi
+  # Fallback generic name seen on some distros
+  if [[ -z "$svc" ]] && systemctl list-unit-files | grep -q "^php-fpm\.service"; then
+    svc="php-fpm.service"
+  fi
+  echo "$svc"
+}
+
+restart_php_fpm() {
+  local svc
+  svc="$(detect_php_fpm_service)"
+  if [[ -n "$svc" ]]; then
+    info "Restarting php-fpm service: $svc"
+    if systemctl restart "$svc"; then
+      info "php-fpm restarted: $svc"
+    else
+      warn "systemctl restart failed for $svc. Trying 'service' fallback."
+      if command -v service >/dev/null 2>&1 && service "${svc%.service}" restart; then
+        info "php-fpm restarted via service: ${svc%.service}"
+      else
+        err "Failed to restart php-fpm. Please restart it manually."
+      fi
+    fi
+  else
+    warn "No php-fpm service detected. Skipping restart."
+  fi
+}
+
+purge_old_backups() {
+  # $1 = DOMAIN, $2 = days
+  local DOMAIN="$1"
+  local DAYS="$2"
+  local ROOT="${SAVE_BASE}/${DOMAIN}"
+  [[ -d "$ROOT" ]] || return 0
+
+  info "[${DOMAIN}] Purging backup folders older than ${DAYS} days under ${ROOT} ..."
+  # Only remove first-level dated directories older than N days
+  find "$ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$DAYS" -print -exec rm -rf {} +
+}
+
+purge_old_logs() {
+  # $1 = days
+  local DAYS="$1"
+  [[ -d "$LOG_DIR" ]] || return 0
+  info "Purging run logs older than ${DAYS} days in ${LOG_DIR} ..."
+  # Keep latest.log symlink; delete only run_*.log files older than N days
+  find "$LOG_DIR" -type f -name "run_*.log" -mtime +"$DAYS" -print -delete
 }
 
 backup_domain () {
@@ -127,6 +191,9 @@ backup_domain () {
   fi
   set +o pipefail
 
+  # 4) Per-domain retention cleanup
+  purge_old_backups "$DOMAIN" "$BACKUP_RETENTION_DAYS"
+
   if [[ $STATUS -eq 0 ]]; then
     info "---- BACKUP completed for ${DOMAIN} ✅ ----"
   else
@@ -153,7 +220,6 @@ list_versions() {
     return 1
   fi
 
-  # Find DB dumps, pair with corresponding files tar in same dir
   mapfile -t DB_FILES < <(find "$ROOT" -type f -name "db_*.sql.gz" | sort -r)
   if [[ ${#DB_FILES[@]} -eq 0 ]]; then
     warn "[${DOMAIN}] No DB dumps found."
@@ -183,7 +249,6 @@ list_versions() {
   echo "Available versions for ${DOMAIN}:"
   local i
   for i in "${!V_TS[@]}"; do
-    # Pretty date if possible
     local human
     if human="$(date -d "${V_TS[$i]}" +'%Y-%m-%d %H:%M:%S' 2>/dev/null)"; then
       printf "%2d) %s  (dir: %s)\n" "$((i+1))" "$human [${V_TS[$i]}]" "$(basename "${V_DIR[$i]}")"
@@ -292,6 +357,9 @@ restore_domain () {
     return 1
   fi
 
+  # 4) Restart php-fpm (auto-detected service)
+  restart_php_fpm
+
   info "---- RESTORE completed for ${DOMAIN} ✅ ----"
 }
 
@@ -365,6 +433,9 @@ if [[ "$ACT_CHOICE" == "2" || "$ACT_CHOICE" == "3" ]]; then
     exit 1
   fi
 fi
+
+# --- Log rotation (always run once per script invocation) ---
+purge_old_logs "$LOG_RETENTION_DAYS"
 
 echo
 info "==== Run finished. Log: ${RUN_LOG} | Latest: ${LOG_DIR}/latest.log ===="
