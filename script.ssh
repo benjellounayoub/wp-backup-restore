@@ -1,79 +1,175 @@
 #!/bin/bash
-set -euo pipefail
+# WordPress multi-project backup with logging
+# - Files: /var/www/html/<domain>
+# - Nginx: /etc/nginx/sites-available/<domain>
+# - DB: parsed from wp-config.php
+# - Backups: /var/www/save/<domain>/<YYYY-MM-DD>/
+# - Logs: /var/log/wp-backup/run_<timestamp>.log (and latest.log)
 
-# === Menu ===
-echo "Select the project to back up:"
-echo "1) domain1.com"
-echo "2) domain2.com"
-echo "3) domain3.ca"
-echo "4) domain4.ca"
-echo "5) domain5.ca"
-echo "6) domain6.com"
-read -rp "Enter number [1-6]: " CHOICE
+set -Euo pipefail
 
-case "$CHOICE" in
-  1) DOMAIN="domain1.com" ;;
-  2) DOMAIN="domain2.com" ;;
-  3) DOMAIN="domain3.ca" ;;
-  4) DOMAIN="domain4.ca" ;;
-  5) DOMAIN="domain5.ca" ;;
-  6) DOMAIN="domain6.com" ;;
-  *) echo "Invalid choice"; exit 1 ;;
-esac
-
-# === Paths & timestamps ===
-WEBROOT="/var/www/html/${DOMAIN}"
-NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}"
-DATE_DIR="$(date +%Y-%m-%d)"             # safer (no spaces)
-TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-BACKUP_DIR="/var/www/save/${DOMAIN}/${DATE_DIR}"
-
-# === Ensure backup dir exists ===
-sudo mkdir -p "$BACKUP_DIR"
-
-# === Find DB creds from WordPress wp-config.php ===
-WP_CONFIG="${WEBROOT}/wp-config.php"
-if [[ ! -f "$WP_CONFIG" ]]; then
-  echo "Error: wp-config.php not found at $WP_CONFIG"
+# --- Require root ---
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run this script with sudo (root). Example: sudo $0"
   exit 1
 fi
 
-# Parse DB_NAME and DB_USER from wp-config.php
-DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")"
-DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")"
+# --- Config ---
+WEBROOT_BASE="/var/www/html"
+SAVE_BASE="/var/www/save"
+NGINX_BASE="/etc/nginx/sites-available"
+LOG_DIR="/var/log/wp-backup"
+RUN_TS="$(date +%Y%m%d%H%M%S)"
+DATE_DIR="$(date +%Y-%m-%d)"
+RUN_LOG="${LOG_DIR}/run_${RUN_TS}.log"
 
-# Fallback prompt if parsing fails
-if [[ -z "${DB_NAME}" ]]; then
-  read -rp "Couldn't detect DB_NAME. Enter DB name: " DB_NAME
-fi
-if [[ -z "${DB_USER}" ]]; then
-  read -rp "Couldn't detect DB_USER. Enter DB user: " DB_USER
-fi
+# Projects (add/remove domains here)
+PROJECTS=(
+  "domain1.com"
+  "domain2.com"
+  "domain3.com"
+  "domain4.com"
+  "domain5.ca"
+  "domain6.com"
+)
 
-echo "Backing up domain: $DOMAIN"
-echo "Webroot: $WEBROOT"
-echo "Nginx conf: $NGINX_CONF"
-echo "DB_USER: $DB_USER"
-echo "DB_NAME: $DB_NAME"
+# --- Prepare logging ---
+mkdir -p "$LOG_DIR"
+touch "$RUN_LOG"
+ln -sfn "$RUN_LOG" "${LOG_DIR}/latest.log"
+# Log everything to console AND file
+exec > >(tee -a "$RUN_LOG") 2>&1
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { echo "$(ts) [$1] ${*:2}"; }
+info() { log INFO "$@"; }
+warn() { log WARN "$@"; }
+err()  { log ERROR "$@"; }
+
+info "==== WP Backup Run Started: ${RUN_TS} ===="
+
+# --- Menu ---
 echo
+echo "Select what to back up:"
+echo "1) ALL projects (default)"
+i=2
+for d in "${PROJECTS[@]}"; do
+  echo "${i}) ${d}"
+  ((i++))
+done
+read -rp "Enter choice [1-$(( ${#PROJECTS[@]} + 1 )) , default 1]: " CHOICE
+CHOICE="${CHOICE:-1}"
 
-# === Backup website files (compressed) ===
-sudo tar czf "${BACKUP_DIR}/${TIMESTAMP}_files.tar.gz" -C "/var/www/html" "${DOMAIN}"
-
-# === Backup nginx site config ===
-if [[ -f "$NGINX_CONF" ]]; then
-  sudo cp "$NGINX_CONF" "$BACKUP_DIR/"
+DOMAINS=()
+if [[ "$CHOICE" == "1" ]]; then
+  DOMAINS=("${PROJECTS[@]}")
 else
-  echo "Warning: Nginx config not found at $NGINX_CONF (skipping)."
+  index=$((CHOICE - 2))  # because 1 is "All"
+  if [[ $index -lt 0 || $index -ge ${#PROJECTS[@]} ]]; then
+    err "Invalid choice."
+    exit 1
+  fi
+  DOMAINS=("${PROJECTS[$index]}")
 fi
 
-# === Backup MariaDB database (compressed) ===
-# Prompts securely for password
-mysqldump -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_DIR}/db_${TIMESTAMP}.sql.gz"
+info "Selected domains: ${DOMAINS[*]}"
 
-# === Summary ===
+# --- Backup function ---
+backup_domain () {
+  local DOMAIN="$1"
+  local WEBROOT="${WEBROOT_BASE}/${DOMAIN}"
+  local NGINX_CONF="${NGINX_BASE}/${DOMAIN}"
+  local BACKUP_DIR="${SAVE_BASE}/${DOMAIN}/${DATE_DIR}"
+  local TS_DETAIL="$(date +%Y%m%d%H%M%S)"
+  local STATUS=0
+
+  info "---- Starting backup for ${DOMAIN} ----"
+  info "Paths: WEBROOT=${WEBROOT}  NGINX=${NGINX_CONF}  BACKUP_DIR=${BACKUP_DIR}"
+
+  mkdir -p "${BACKUP_DIR}" || { err "Failed to create ${BACKUP_DIR}"; return 1; }
+
+  # wp-config.php for DB creds
+  local WP_CONFIG="${WEBROOT}/wp-config.php"
+  if [[ ! -f "$WP_CONFIG" ]]; then
+    err "wp-config.php not found at ${WP_CONFIG} (skipping ${DOMAIN})"
+    return 1
+  fi
+
+  # Parse DB_NAME and DB_USER
+  local DB_NAME DB_USER
+  DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")" || true
+  DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")" || true
+
+  if [[ -z "${DB_NAME:-}" ]]; then
+    read -rp "[$DOMAIN] Couldn't detect DB_NAME. Enter DB name: " DB_NAME
+  fi
+  if [[ -z "${DB_USER:-}" ]]; then
+    read -rp "[$DOMAIN] Couldn't detect DB_USER. Enter DB user: " DB_USER
+  fi
+  info "[${DOMAIN}] DB_USER=${DB_USER} DB_NAME=${DB_NAME}"
+
+  # 1) Backup site files
+  if [[ -d "$WEBROOT" ]]; then
+    info "[${DOMAIN}] Archiving files..."
+    if tar czf "${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz" -C "${WEBROOT_BASE}" "${DOMAIN}"; then
+      info "[${DOMAIN}] Files archived -> ${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz"
+    else
+      err  "[${DOMAIN}] FAILED to archive files."
+      STATUS=1
+    fi
+  else
+    warn "[${DOMAIN}] Webroot not found at ${WEBROOT} (skipping files)."
+    STATUS=1
+  fi
+
+  # 2) Backup nginx config
+  if [[ -f "$NGINX_CONF" ]]; then
+    if cp "$NGINX_CONF" "$BACKUP_DIR/"; then
+      info "[${DOMAIN}] Nginx config copied -> ${BACKUP_DIR}/$(basename "$NGINX_CONF")"
+    else
+      err  "[${DOMAIN}] FAILED to copy nginx config."
+      STATUS=1
+    fi
+  else
+    warn "[${DOMAIN}] Nginx config not found at ${NGINX_CONF} (skipping)."
+  fi
+
+  # 3) Backup MariaDB (compressed) — prompts for password with -p
+  info "[${DOMAIN}] Dumping DB (you will be prompted for ${DB_USER}'s password)..."
+  set -o pipefail
+  if mysqldump -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"; then
+    info "[${DOMAIN}] DB dump saved -> ${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"
+  else
+    err  "[${DOMAIN}] FAILED to dump database."
+    STATUS=1
+  fi
+  set +o pipefail
+
+  if [[ $STATUS -eq 0 ]]; then
+    info "---- Completed backup for ${DOMAIN} ✅ ----"
+  else
+    err  "---- Completed with errors for ${DOMAIN} ❌ ----"
+  fi
+
+  return $STATUS
+}
+
+# --- Run backups ---
+FAILED=()
+for d in "${DOMAINS[@]}"; do
+  if ! backup_domain "$d"; then
+    FAILED+=("$d")
+  fi
+done
+
+# --- Summary ---
 echo
-echo "Backup completed:"
-echo " - Files:   ${BACKUP_DIR}/${TIMESTAMP}_files.tar.gz"
-echo " - Nginx:   ${BACKUP_DIR}/$(basename "$NGINX_CONF" 2>/dev/null || true)"
-echo " - DB dump: ${BACKUP_DIR}/db_${TIMESTAMP}.sql.gz"
+info "==== Backup Summary (${RUN_TS}) ===="
+if [[ ${#FAILED[@]} -eq 0 ]]; then
+  info "All selected backups completed successfully. 🎉"
+else
+  err "Backups failed for: ${FAILED[*]}"
+fi
+info "Run log: ${RUN_LOG}"
+info "Latest log symlink: ${LOG_DIR}/latest.log"
+info "==== WP Backup Run Finished ===="
