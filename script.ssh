@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# === Variables ===
+BACKUP_DIR=/var/www/save/backup/domain.com/$(date)
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+DB_USER="your_db_user"
+DB_NAME="your_db_name"
+
+# === Create backup directory ===
+sudo mkdir -p $BACKUP_DIR
+
+# === Backup website files ===
+sudo tar czf $BACKUP_DIR/${TIMESTAMP}_files.tar.gz /var/www/html/domain.com
+
+# === Backup nginx config ===
+sudo cp /etc/nginx/sites-available/domain.com $BACKUP_DIR/
+
+# === Backup MariaDB database (compressed) ===
+mysqldump -u $DB_USER -p $DB_NAME | gzip > $BACKUP_DIR/db_${TIMESTAMP}.sql.gz
