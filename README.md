@@ -4,9 +4,11 @@ Easily back up and restore multiple WordPress sites hosted on the same server.
 
 ---
 
-## 📦 Installation
+## 📦 Quick Installation
 
-Clone the project from GitHub:
+The project includes an **install script** that automates setup for you.
+
+### 1️⃣ Clone and install
 
 ```bash
 # Using SSH (recommended)
@@ -14,33 +16,33 @@ git clone git@github.com:benjellounayoub/wp-backup-restore.git
 
 # or using HTTPS
 git clone https://github.com/benjellounayoub/wp-backup-restore.git
-```
 
-Install it properly:
-
-```bash
 cd wp-backup-restore
-
-# Copy main script to /opt (software)
-sudo mkdir -p /opt/wp-backup-restore
-sudo cp script.sh /opt/wp-backup-restore/
-sudo chmod +x /opt/wp-backup-restore/script.sh
-
-# Copy configuration file to /etc (settings)
-sudo mkdir -p /etc/wp-backup-restore
-sudo cp settings.conf /etc/wp-backup-restore/
+sudo bash install.sh
 ```
 
-(Optional) Create a global shortcut command:
+This will:
+- Clone the project into `/opt/wp-backup-restore`
+- Install the configuration in `/etc/wp-backup-restore/settings.conf`
+- Create log and backup directories:
+  - `/var/log/wp-backup-restore/`
+  - `/var/www/backup/`
+- Create a global shortcut `wpbr` linked to `/opt/wp-backup-restore/script.sh`
 
-```bash
-sudo ln -s /opt/wp-backup-restore/script.sh /usr/local/bin/wpbr
-```
-
-Then run:
+### 2️⃣ Run it
 
 ```bash
 sudo wpbr
+```
+
+### 3️⃣ Optional flags for advanced use
+
+```bash
+sudo bash install.sh --update        # Pull latest changes
+sudo bash install.sh --https         # Use HTTPS for cloning
+sudo bash install.sh --branch dev    # Clone specific branch
+sudo bash install.sh --no-clone      # Skip cloning (use local files)
+sudo bash install.sh --force-link    # Recreate /usr/local/bin/wpbr symlink
 ```
 
 ---
