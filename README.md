@@ -4,52 +4,9 @@ Easily back up and restore multiple WordPress sites hosted on the same server.
 
 ---
 
-## 📦 Quick Installation
-
-The project includes an **install script** that automates setup for you.
-
-### 1️⃣ Clone and install
-
-```bash
-# Using SSH (recommended)
-git clone git@github.com:benjellounayoub/wp-backup-restore.git
-
-# or using HTTPS
-git clone https://github.com/benjellounayoub/wp-backup-restore.git
-
-cd wp-backup-restore
-sudo bash install.sh
-```
-
-This will:
-- Clone the project into `/opt/wp-backup-restore`
-- Install the configuration in `/etc/wp-backup-restore/settings.conf`
-- Create log and backup directories:
-  - `/var/log/wp-backup-restore/`
-  - `/var/www/backup/`
-- Create a global shortcut `wpbr` linked to `/opt/wp-backup-restore/script.sh`
-
-### 2️⃣ Run it
-
-```bash
-sudo wpbr
-```
-
-### 3️⃣ Optional flags for advanced use
-
-```bash
-sudo bash install.sh --update        # Pull latest changes
-sudo bash install.sh --https         # Use HTTPS for cloning
-sudo bash install.sh --branch dev    # Clone specific branch
-sudo bash install.sh --no-clone      # Skip cloning (use local files)
-sudo bash install.sh --force-link    # Recreate /usr/local/bin/wpbr symlink
-```
-
----
-
 ## 🧩 Features
 
-- **Supports:** Nginx **or** Apache · MariaDB/MySQL **or** PostgreSQL  
+- **Supports:** Nginx **or** Apache · MariaDB **or** MySQL **or** PostgreSQL  
 - **Backups:** site files (`.tar.gz`) + vhost config + database dump (`.sql.gz`)  
 - **Restore:** full or partial restore with confirmation prompts  
 - **Retention:** auto-prune old backups and logs  
@@ -72,7 +29,37 @@ sudo bash install.sh --force-link    # Recreate /usr/local/bin/wpbr symlink
 
 ---
 
-## 🧾 Configuration (`/etc/wp-backup-restore/settings.conf`)
+## 📦 Quick Installation
+
+The project includes an **install script** that automates setup for you.
+
+### 1️⃣ Clone and install
+
+```bash
+cd /tmp
+git clone https://github.com/benjellounayoub/wp-backup-restore.git
+cd wp-backup-restore
+sudo bash install.sh --https --branch develop
+```
+
+This will:
+- Clone the project into `/opt/wp-backup-restore`
+- Install the configuration in `/etc/wp-backup-restore/settings.conf`
+- Create log and backup directories:
+  - `/var/log/wp-backup-restore/`
+  - `/var/www/backup/`
+- Create a global shortcut `wpbr` linked to `/opt/wp-backup-restore/script.sh`
+
+Optional flags (for advanced use only, please skip otherwise):
+```bash
+sudo bash install.sh --update        # Pull latest changes
+sudo bash install.sh --https         # Use HTTPS for cloning
+sudo bash install.sh --branch dev    # Clone specific branch
+sudo bash install.sh --no-clone      # Skip cloning (use local files)
+sudo bash install.sh --force-link    # Recreate /usr/local/bin/wpbr symlink
+```
+
+## 2️⃣ Adapt settings.conf to your environment (`/etc/wp-backup-restore/settings.conf`)
 
 Key fields (defaults shown):
 
@@ -98,22 +85,33 @@ DB_HOST_DEFAULT="localhost"
 DB_PORT_DEFAULT=""   # empty = engine default (3306/5432)
 
 # Project registry
-PROJECTS=( "domain1.com" "domain2.com" "domain3.com" "domain4.com" "domain5.com" "domain6.com" )
+PROJECTS=( 
+  "domain1.com" 
+  "domain2.com" 
+  "domain3.com"
+  ... 
+)
 
 # Mappings (values can be absolute paths or relative to *_BASE)
 declare -A PROJECT_WEB=(
   [domain1.com]="domain1.com"
+  [domain2.com]="domain2.com"
+  [domain3.com]="domain3.com"
+  ...
 )
 declare -A PROJECT_VHOST=(
-  [domain1.com]="domain1.com"        # Apache usually needs .conf (e.g. domain1.com.conf)
+  [domain1.com]="domain1.com.conf"        # Apache usually needs .conf (e.g. domain1.com.conf)
+  [domain2.com]="domain2.com.conf" 
+  [domain3.com]="domain3.com.conf" 
+  ...
 )
 
 # Optional per‑project DB overrides (empty = auto-detect from wp-config.php for MySQL/MariaDB)
-declare -A PROJECT_DB_ENGINE=( [domain1.com]="" )
-declare -A PROJECT_DB=( [domain1.com]="" )
-declare -A PROJECT_DB_USER=( [domain1.com]="" )
-declare -A PROJECT_DB_HOST=( [domain1.com]="" )
-declare -A PROJECT_DB_PORT=( [domain1.com]="" )
+declare -A PROJECT_DB_ENGINE=( [domain1.com]="mysql" )
+declare -A PROJECT_DB=( [domain1.com]="DOMAIN1_DB_NAME" )
+declare -A PROJECT_DB_USER=( [domain1.com]="DOMAIN1_DB_USER" )
+declare -A PROJECT_DB_HOST=( [domain1.com]="DOMAIN1_DB_HOST" )
+declare -A PROJECT_DB_PORT=( [domain1.com]="DOMAIN1_DB_PORT" )
 ```
 
 Tips:
@@ -125,22 +123,7 @@ Tips:
 
 ---
 
-## 💾 Backup Structure
-
-For each project and each run (date folder `YYYYMMDD`):
-
-```
-/var/www/backup/<domain>/<YYYYMMDD>/
-├── <timestamp>_files.tar.gz        # Site files (WordPress root)
-├── db_<timestamp>.sql.gz           # Database dump
-└── <vhost_filename>                # Nginx/Apache vhost file
-```
-
-`<timestamp>` is `YYYYMMDDHHMMSS`, allowing multiple backups per day.
-
----
-
-## 🚀 Usage
+## 3️⃣ Usage
 
 Run the script:
 
@@ -166,6 +149,21 @@ What would you like to do?
 - Choose a project and a **version** to restore.
 - Confirm by typing `RESTORE`.
 - The script creates a **pre‑restore snapshot**, restores files + vhost + DB, tests the web server, and restarts PHP‑FPM if detected.
+
+---
+
+## 💾 Backup Structure
+
+For each project and each run (date folder `YYYYMMDD`):
+
+```
+/var/www/backup/<domain>/<YYYYMMDD>/
+├── <timestamp>_files.tar.gz        # Site files (WordPress root)
+├── db_<timestamp>.sql.gz           # Database dump
+└── <vhost_filename>                # Nginx/Apache vhost file
+```
+
+`<timestamp>` is `YYYYMMDDHHMMSS`, allowing multiple backups per day.
 
 ---
 
