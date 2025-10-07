@@ -1,21 +1,66 @@
 # WordPress Multi‑Site Backup & Restore
 
-A single Bash tool to **backup and restore multiple WordPress projects** on one server.
-
-- **Script:** `/etc/wp-backup-restore/script.sh`
-- **Config:** `/etc/wp-backup-restore/settings.conf`
-- **Supports:** Nginx **or** Apache · MariaDB/MySQL **or** PostgreSQL
-- **Backups:** site files (`.tar.gz`) + vhost file + DB dump (`.sql.gz`)
-- **Restore:** files + vhost + DB, then (optionally) reload web server and restart php-fpm
-- **Retention:** auto-prune old backups & logs
-- **Logging:** `/var/log/wp-backup-restore/` (with `latest.log` symlink)
+Easily back up and restore multiple WordPress sites hosted on the same server.
 
 ---
 
-## Requirements
+## 📦 Installation
 
-- Linux with Bash **4+** (Ubuntu/Debian/Rocky/Alma/CentOS etc.)
-- Root privileges to run (`sudo`)
+Clone the project from GitHub:
+
+```bash
+# Using SSH (recommended)
+git clone git@github.com:benjellounayoub/wp-backup-restore.git
+
+# or using HTTPS
+git clone https://github.com/benjellounayoub/wp-backup-restore.git
+```
+
+Install it properly:
+
+```bash
+cd wp-backup-restore
+
+# Copy main script to /opt (software)
+sudo mkdir -p /opt/wp-backup-restore
+sudo cp script.sh /opt/wp-backup-restore/
+sudo chmod +x /opt/wp-backup-restore/script.sh
+
+# Copy configuration file to /etc (settings)
+sudo mkdir -p /etc/wp-backup-restore
+sudo cp settings.conf /etc/wp-backup-restore/
+```
+
+(Optional) Create a global shortcut command:
+
+```bash
+sudo ln -s /opt/wp-backup-restore/script.sh /usr/local/bin/wpbr
+```
+
+Then run:
+
+```bash
+sudo wpbr
+```
+
+---
+
+## 🧩 Features
+
+- **Supports:** Nginx **or** Apache · MariaDB/MySQL **or** PostgreSQL  
+- **Backups:** site files (`.tar.gz`) + vhost config + database dump (`.sql.gz`)  
+- **Restore:** full or partial restore with confirmation prompts  
+- **Retention:** auto-prune old backups and logs  
+- **Logging:** `/var/log/wp-backup-restore/` (with `latest.log` symlink)  
+- **Multi-project aware:** can back up or restore all or a single site interactively  
+- **Safe:** pre‑restore backup snapshot before overwriting data  
+
+---
+
+## ⚙️ Requirements
+
+- Linux with Bash **4+**
+- Root privileges (`sudo`)
 - DB client tools installed as needed:
   - MariaDB/MySQL: `mysql`, `mysqldump`
   - PostgreSQL: `psql`, `pg_dump`
@@ -25,42 +70,7 @@ A single Bash tool to **backup and restore multiple WordPress projects** on one 
 
 ---
 
-## Install
-
-1) Create the directory and place files
-
-```bash
-sudo mkdir -p /etc/wp-backup-restore
-# put script.sh and settings.conf in this folder
-# (or move them if you already have them elsewhere)
-sudo mv script.sh /etc/wp-backup-restore/ 2>/dev/null || true
-sudo mv settings.conf /etc/wp-backup-restore/ 2>/dev/null || true
-```
-
-2) Make the script executable
-
-```bash
-sudo chmod +x /etc/wp-backup-restore/script.sh
-```
-
-3) (Optional) Add to PATH for convenience
-
-```bash
-echo 'alias wpbr="/etc/wp-backup-restore/script.sh"' | sudo tee /etc/profile.d/wpbr.sh >/dev/null
-source /etc/profile.d/wpbr.sh
-```
-
-Run it:
-
-```bash
-sudo /etc/wp-backup-restore/script.sh
-# or, if you added the alias:
-sudo wpbr
-```
-
----
-
-## Configure (`/etc/wp-backup-restore/settings.conf`)
+## 🧾 Configuration (`/etc/wp-backup-restore/settings.conf`)
 
 Key fields (defaults shown):
 
@@ -91,11 +101,9 @@ PROJECTS=( "domain1.com" "domain2.com" "domain3.com" "domain4.com" "domain5.com"
 # Mappings (values can be absolute paths or relative to *_BASE)
 declare -A PROJECT_WEB=(
   [domain1.com]="domain1.com"
-  # ...
 )
 declare -A PROJECT_VHOST=(
   [domain1.com]="domain1.com"        # Apache usually needs .conf (e.g. domain1.com.conf)
-  # ...
 )
 
 # Optional per‑project DB overrides (empty = auto-detect from wp-config.php for MySQL/MariaDB)
@@ -115,30 +123,30 @@ Tips:
 
 ---
 
-## What gets backed up
+## 💾 Backup Structure
 
 For each project and each run (date folder `YYYYMMDD`):
 
 ```
 /var/www/backup/<domain>/<YYYYMMDD>/
-├── <timestamp>_files.tar.gz        # Site files (WordPress root for that site)
+├── <timestamp>_files.tar.gz        # Site files (WordPress root)
 ├── db_<timestamp>.sql.gz           # Database dump
 └── <vhost_filename>                # Nginx/Apache vhost file
 ```
 
-`<timestamp>` is `YYYYMMDDHHMMSS` (per run), and multiple backups may exist per day.
+`<timestamp>` is `YYYYMMDDHHMMSS`, allowing multiple backups per day.
 
 ---
 
-## How to use
+## 🚀 Usage
 
 Run the script:
 
 ```bash
-sudo /etc/wp-backup-restore/script.sh
+sudo wpbr
 ```
 
-You’ll see a menu:
+You’ll see an interactive menu:
 
 ```
 What would you like to do?
@@ -153,21 +161,19 @@ What would you like to do?
 - Old backups are pruned automatically (per `BACKUP_RETENTION_DAYS`).
 
 ### Restore
-- Choose a project; select a **version** from the list.
-- Confirm by typing `RESTORE` (safety).
-- The script creates a **pre‑restore snapshot**, restores files + vhost + DB,
-  then tests and optionally reloads the web server.
-- Finally, it restarts `php-fpm` when present.
+- Choose a project and a **version** to restore.
+- Confirm by typing `RESTORE`.
+- The script creates a **pre‑restore snapshot**, restores files + vhost + DB, tests the web server, and restarts PHP‑FPM if detected.
 
 ---
 
-## Logs & Retention
+## 🧠 Logs & Retention
 
 - Run logs: `/var/log/wp-backup-restore/run_<timestamp>.log`
-- Convenience symlink: `/var/log/wp-backup-restore/latest.log`
-- Old logs are pruned per `LOG_RETENTION_DAYS`.
+- Latest run: `/var/log/wp-backup-restore/latest.log`
+- Old logs pruned automatically per `LOG_RETENTION_DAYS`.
 
-Check the latest run:
+View live log output:
 
 ```bash
 sudo tail -f /var/log/wp-backup-restore/latest.log
@@ -175,7 +181,7 @@ sudo tail -f /var/log/wp-backup-restore/latest.log
 
 ---
 
-## Cron (optional)
+## ⏰ Cron Automation (Optional)
 
 Nightly backup of **ALL** projects at 2:00 AM:
 
@@ -186,40 +192,41 @@ sudo crontab -e
 Add:
 
 ```cron
-0 2 * * * /etc/wp-backup-restore/script.sh >/dev/null 2>&1
+0 2 * * * /opt/wp-backup-restore/script.sh >/dev/null 2>&1
 ```
 
-> Ensure your `settings.conf` has the correct project list and mappings before enabling cron.
+> Make sure your `settings.conf` is configured correctly before enabling cron.
 
 ---
 
-## Troubleshooting
+## 🧯 Troubleshooting
 
-| Issue | Hint                                                                                                           |
-|------|----------------------------------------------------------------------------------------------------------------|
-| `Permission denied` | Run with `sudo`. Ensure `/var/www/backup` is writable.                                                         |
-| Nginx/Apache reload fails | Run `nginx -t` or `apache2ctl -t` to validate config; fix and retry.                                           |
-| MySQL/MariaDB prompts every time | That’s expected for secure password input (`-p`). Consider using `.my.cnf` with proper permissions if desired. |
-| PostgreSQL auth errors | Ensure the DB user has rights; check `pg_hba.conf`. Use `psql -U user -h host -p port dbname`.                 |
-| Wrong vhost file backed up | Verify `PROJECT_VHOST[domain]` and `SERVER_TYPE`. For Apache, include `.conf` if used by your distro.          |
-| Auto-detect DB failed | Fill `PROJECT_DB[domain]` and `PROJECT_DB_USER[domain]` explicitly.                                            |
-
----
-
-## Security Notes
-
-- Backups may contain **sensitive data** (wp-config, uploads). Limit access to `/var/www/backup` and `/var/log/wp-backup-restore`.
-- Consider off‑site syncing (e.g., rsync to another server or cloud storage).
-- Keep DB credentials out of shell history; the script prompts interactively.
+| Issue | Hint |
+|------|------|
+| `Permission denied` | Run with `sudo`. Ensure `/var/www/backup` is writable. |
+| Nginx/Apache reload fails | Run `nginx -t` or `apache2ctl -t` to validate config; fix and retry. |
+| MySQL/MariaDB prompts every time | That’s expected for secure password input (`-p`). |
+| PostgreSQL auth errors | Ensure correct user privileges; check `pg_hba.conf`. |
+| Wrong vhost file backed up | Check `PROJECT_VHOST[domain]` and `SERVER_TYPE`. |
+| Auto-detect DB failed | Provide `PROJECT_DB` and `PROJECT_DB_USER` explicitly. |
 
 ---
 
-## License
+## 🔒 Security Notes
 
-MIT — do what you want, just don’t hold the authors liable.
+- Backups may include sensitive files (`wp-config.php`, uploads, etc.). Restrict permissions on `/var/www/backup` and `/var/log/wp-backup-restore`.
+- Consider off‑site or encrypted backups (`rsync`, `rclone`, `gpg`, etc.).
+- DB credentials are never stored; they’re requested interactively.
 
 ---
 
-## Credits
+## 📜 License
 
-Maintained by **Mohamed‑Ayoub Benjelloun**. Contributions welcome.
+MIT — free to use, modify, and distribute.
+
+---
+
+## 👤 Author
+
+Maintained by [**Mohamed‑Ayoub Benjelloun**](https://github.com/benjellounayoub).  
+Contributions and pull requests are welcome.
