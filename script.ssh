@@ -1,10 +1,13 @@
 #!/bin/bash
-# WordPress multi-project backup with logging
-# - Files: /var/www/html/<domain>
-# - Nginx: /etc/nginx/sites-available/<domain>
-# - DB: parsed from wp-config.php
-# - Backups: /var/www/save/<domain>/<YYYY-MM-DD>/
-# - Logs: /var/log/wp-backup/run_<timestamp>.log (and latest.log)
+# WordPress multi-project BACKUP & RESTORE with logging
+# Backups:
+#   Files -> /var/www/save/<domain>/<YYYY-MM-DD>/<TS>_files.tar.gz
+#   DB    -> /var/www/save/<domain>/<YYYY-MM-DD>/db_<TS>.sql.gz
+#   Nginx -> copied to same dated folder
+# Logs:
+#   /var/log/wp-backup/run_<timestamp>.log  (+ latest.log symlink)
+#
+# Requirements: Debian/Ubuntu-like (nginx, mariadb/mysql, gzip, tar, find, tee)
 
 set -Euo pipefail
 
@@ -19,16 +22,18 @@ WEBROOT_BASE="/var/www/html"
 SAVE_BASE="/var/www/save"
 NGINX_BASE="/etc/nginx/sites-available"
 LOG_DIR="/var/log/wp-backup"
+WEB_OWNERSHIP="www-data:www-data"   # adjust if needed (e.g., nginx:nginx)
+
 RUN_TS="$(date +%Y%m%d%H%M%S)"
 DATE_DIR="$(date +%Y-%m-%d)"
 RUN_LOG="${LOG_DIR}/run_${RUN_TS}.log"
 
-# Projects (add/remove domains here)
+# Projects (edit here to add/remove)
 PROJECTS=(
   "domain1.com"
   "domain2.com"
-  "domain3.com"
-  "domain4.com"
+  "domain3.ca"
+  "domain4.ca"
   "domain5.ca"
   "domain6.com"
 )
@@ -37,7 +42,6 @@ PROJECTS=(
 mkdir -p "$LOG_DIR"
 touch "$RUN_LOG"
 ln -sfn "$RUN_LOG" "${LOG_DIR}/latest.log"
-# Log everything to console AND file
 exec > >(tee -a "$RUN_LOG") 2>&1
 
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -46,36 +50,33 @@ info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
 err()  { log ERROR "$@"; }
 
-info "==== WP Backup Run Started: ${RUN_TS} ===="
+info "==== WP Backup/Restore Run Started: ${RUN_TS} ===="
 
-# --- Menu ---
-echo
-echo "Select what to back up:"
-echo "1) ALL projects (default)"
-i=2
-for d in "${PROJECTS[@]}"; do
-  echo "${i}) ${d}"
-  ((i++))
-done
-read -rp "Enter choice [1-$(( ${#PROJECTS[@]} + 1 )) , default 1]: " CHOICE
-CHOICE="${CHOICE:-1}"
+# --- Helpers ---
+get_db_creds() {
+  # $1 = DOMAIN, returns DB_USER, DB_NAME (globals)
+  local DOMAIN="$1"
+  local WP_CONFIG="${WEBROOT_BASE}/${DOMAIN}/wp-config.php"
 
-DOMAINS=()
-if [[ "$CHOICE" == "1" ]]; then
-  DOMAINS=("${PROJECTS[@]}")
-else
-  index=$((CHOICE - 2))  # because 1 is "All"
-  if [[ $index -lt 0 || $index -ge ${#PROJECTS[@]} ]]; then
-    err "Invalid choice."
-    exit 1
+  if [[ ! -f "$WP_CONFIG" ]]; then
+    err "[${DOMAIN}] wp-config.php not found at ${WP_CONFIG}"
+    return 1
   fi
-  DOMAINS=("${PROJECTS[$index]}")
-fi
 
-info "Selected domains: ${DOMAINS[*]}"
+  DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")" || true
+  DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")" || true
 
-# --- Backup function ---
+  if [[ -z "${DB_NAME:-}" ]]; then
+    read -rp "[${DOMAIN}] Couldn't detect DB_NAME. Enter DB name: " DB_NAME
+  fi
+  if [[ -z "${DB_USER:-}" ]]; then
+    read -rp "[${DOMAIN}] Couldn't detect DB_USER. Enter DB user: " DB_USER
+  fi
+  info "[${DOMAIN}] DB_USER=${DB_USER} DB_NAME=${DB_NAME}"
+}
+
 backup_domain () {
+  # $1 = DOMAIN
   local DOMAIN="$1"
   local WEBROOT="${WEBROOT_BASE}/${DOMAIN}"
   local NGINX_CONF="${NGINX_BASE}/${DOMAIN}"
@@ -83,93 +84,287 @@ backup_domain () {
   local TS_DETAIL="$(date +%Y%m%d%H%M%S)"
   local STATUS=0
 
-  info "---- Starting backup for ${DOMAIN} ----"
+  info "---- Starting BACKUP for ${DOMAIN} ----"
   info "Paths: WEBROOT=${WEBROOT}  NGINX=${NGINX_CONF}  BACKUP_DIR=${BACKUP_DIR}"
-
   mkdir -p "${BACKUP_DIR}" || { err "Failed to create ${BACKUP_DIR}"; return 1; }
 
-  # wp-config.php for DB creds
-  local WP_CONFIG="${WEBROOT}/wp-config.php"
-  if [[ ! -f "$WP_CONFIG" ]]; then
-    err "wp-config.php not found at ${WP_CONFIG} (skipping ${DOMAIN})"
-    return 1
-  fi
+  get_db_creds "$DOMAIN" || STATUS=1
 
-  # Parse DB_NAME and DB_USER
-  local DB_NAME DB_USER
-  DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")" || true
-  DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")" || true
-
-  if [[ -z "${DB_NAME:-}" ]]; then
-    read -rp "[$DOMAIN] Couldn't detect DB_NAME. Enter DB name: " DB_NAME
-  fi
-  if [[ -z "${DB_USER:-}" ]]; then
-    read -rp "[$DOMAIN] Couldn't detect DB_USER. Enter DB user: " DB_USER
-  fi
-  info "[${DOMAIN}] DB_USER=${DB_USER} DB_NAME=${DB_NAME}"
-
-  # 1) Backup site files
+  # 1) Files
   if [[ -d "$WEBROOT" ]]; then
     info "[${DOMAIN}] Archiving files..."
     if tar czf "${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz" -C "${WEBROOT_BASE}" "${DOMAIN}"; then
-      info "[${DOMAIN}] Files archived -> ${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz"
+      info "[${DOMAIN}] Files -> ${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz"
     else
-      err  "[${DOMAIN}] FAILED to archive files."
+      err  "[${DOMAIN}] Files archive FAILED"
       STATUS=1
     fi
   else
-    warn "[${DOMAIN}] Webroot not found at ${WEBROOT} (skipping files)."
+    warn "[${DOMAIN}] Webroot not found at ${WEBROOT} (skipping files)"
     STATUS=1
   fi
 
-  # 2) Backup nginx config
+  # 2) Nginx
   if [[ -f "$NGINX_CONF" ]]; then
     if cp "$NGINX_CONF" "$BACKUP_DIR/"; then
-      info "[${DOMAIN}] Nginx config copied -> ${BACKUP_DIR}/$(basename "$NGINX_CONF")"
+      info "[${DOMAIN}] Nginx -> ${BACKUP_DIR}/$(basename "$NGINX_CONF")"
     else
-      err  "[${DOMAIN}] FAILED to copy nginx config."
+      err  "[${DOMAIN}] Nginx copy FAILED"
       STATUS=1
     fi
   else
-    warn "[${DOMAIN}] Nginx config not found at ${NGINX_CONF} (skipping)."
+    warn "[${DOMAIN}] Nginx conf not found at ${NGINX_CONF} (skipping)"
   fi
 
-  # 3) Backup MariaDB (compressed) — prompts for password with -p
+  # 3) DB
   info "[${DOMAIN}] Dumping DB (you will be prompted for ${DB_USER}'s password)..."
   set -o pipefail
-  if mysqldump -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"; then
-    info "[${DOMAIN}] DB dump saved -> ${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"
+  if mysqldump --add-drop-table -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"; then
+    info "[${DOMAIN}] DB -> ${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"
   else
-    err  "[${DOMAIN}] FAILED to dump database."
+    err  "[${DOMAIN}] DB dump FAILED"
     STATUS=1
   fi
   set +o pipefail
 
   if [[ $STATUS -eq 0 ]]; then
-    info "---- Completed backup for ${DOMAIN} ✅ ----"
+    info "---- BACKUP completed for ${DOMAIN} ✅ ----"
   else
-    err  "---- Completed with errors for ${DOMAIN} ❌ ----"
+    err  "---- BACKUP completed with errors for ${DOMAIN} ❌ ----"
   fi
 
   return $STATUS
 }
 
-# --- Run backups ---
-FAILED=()
-for d in "${DOMAINS[@]}"; do
-  if ! backup_domain "$d"; then
-    FAILED+=("$d")
-  fi
-done
+list_versions() {
+  # $1 = DOMAIN
+  # Prints indexed list of versions (TS + path), newest first.
+  # Populates global arrays: V_TS[], V_DB[], V_FILES[], V_DIR[]
+  local DOMAIN="$1"
+  local ROOT="${SAVE_BASE}/${DOMAIN}"
 
-# --- Summary ---
+  V_TS=()
+  V_DB=()
+  V_FILES=()
+  V_DIR=()
+
+  if [[ ! -d "$ROOT" ]]; then
+    warn "[${DOMAIN}] No backups found under ${ROOT}"
+    return 1
+  fi
+
+  # Find DB dumps, pair with corresponding files tar in same dir
+  mapfile -t DB_FILES < <(find "$ROOT" -type f -name "db_*.sql.gz" | sort -r)
+  if [[ ${#DB_FILES[@]} -eq 0 ]]; then
+    warn "[${DOMAIN}] No DB dumps found."
+    return 1
+  fi
+
+  for db in "${DB_FILES[@]}"; do
+    local dir ts files_tar
+    dir="$(dirname "$db")"
+    ts="$(basename "$db" | sed -n "s/^db_\([0-9]\{14\}\)\.sql\.gz$/\1/p")"
+    [[ -z "$ts" ]] && continue
+    files_tar="${dir}/${ts}_files.tar.gz"
+    [[ -f "$files_tar" ]] || continue
+
+    V_TS+=("$ts")
+    V_DB+=("$db")
+    V_FILES+=("$files_tar")
+    V_DIR+=("$dir")
+  done
+
+  if [[ ${#V_TS[@]} -eq 0 ]]; then
+    warn "[${DOMAIN}] No complete (files+DB) versions found."
+    return 1
+  fi
+
+  echo
+  echo "Available versions for ${DOMAIN}:"
+  local i
+  for i in "${!V_TS[@]}"; do
+    # Pretty date if possible
+    local human
+    if human="$(date -d "${V_TS[$i]}" +'%Y-%m-%d %H:%M:%S' 2>/dev/null)"; then
+      printf "%2d) %s  (dir: %s)\n" "$((i+1))" "$human [${V_TS[$i]}]" "$(basename "${V_DIR[$i]}")"
+    else
+      printf "%2d) %s  (dir: %s)\n" "$((i+1))" "${V_TS[$i]}" "$(basename "${V_DIR[$i]}")"
+    fi
+  done
+}
+
+restore_domain () {
+  # $1 = DOMAIN
+  local DOMAIN="$1"
+  local WEBROOT="${WEBROOT_BASE}/${DOMAIN}"
+  local NGINX_CONF="${NGINX_BASE}/${DOMAIN}"
+
+  info "---- Starting RESTORE for ${DOMAIN} ----"
+
+  get_db_creds "$DOMAIN" || return 1
+
+  # Choose version
+  if ! list_versions "$DOMAIN"; then
+    err "[${DOMAIN}] No restorable versions."
+    return 1
+  fi
+
+  local choice idx
+  read -rp "Select version number to restore [1-${#V_TS[@]}]: " choice
+  idx=$((choice-1))
+  if [[ -z "${choice:-}" || $idx -lt 0 || $idx -ge ${#V_TS[@]} ]]; then
+    err "Invalid selection."
+    return 1
+  fi
+
+  local SEL_TS="${V_TS[$idx]}"
+  local DB_DUMP="${V_DB[$idx]}"
+  local FILES_TAR="${V_FILES[$idx]}"
+  local BACKUP_DIR="${V_DIR[$idx]}"
+  local NGINX_BAK="${BACKUP_DIR}/${DOMAIN}"
+
+  echo
+  warn "You are about to RESTORE ${DOMAIN} to version ${SEL_TS}."
+  warn "This will overwrite site files and database: ${DB_NAME}"
+  read -rp "Type 'RESTORE' to proceed: " CONFIRM
+  [[ "$CONFIRM" == "RESTORE" ]] || { info "Restore cancelled."; return 1; }
+
+  # Pre-restore snapshot (safety)
+  info "[${DOMAIN}] Creating pre-restore BACKUP snapshot..."
+  if ! backup_domain "$DOMAIN"; then
+    warn "[${DOMAIN}] Pre-restore backup encountered issues (continuing)."
+  fi
+
+  # 1) Restore files
+  if [[ -f "$FILES_TAR" ]]; then
+    info "[${DOMAIN}] Restoring files from ${FILES_TAR} ..."
+    if tar xzf "$FILES_TAR" -C "$WEBROOT_BASE"; then
+      info "[${DOMAIN}] Files restored."
+      if id -u www-data >/dev/null 2>&1; then
+        chown -R "$WEB_OWNERSHIP" "${WEBROOT_BASE}/${DOMAIN}" || warn "[${DOMAIN}] chown failed (check ownership manually)."
+      fi
+    else
+      err "[${DOMAIN}] File restore FAILED."
+      return 1
+    fi
+  else
+    err "[${DOMAIN}] Missing files archive: ${FILES_TAR}"
+    return 1
+  fi
+
+  # 2) Restore nginx config (if present)
+  if [[ -f "$NGINX_BAK" ]]; then
+    info "[${DOMAIN}] Restoring nginx site config..."
+    if cp "$NGINX_BAK" "$NGINX_CONF"; then
+      info "[${DOMAIN}] Nginx config restored to ${NGINX_CONF}"
+      if nginx -t; then
+        read -rp "Reload nginx now? [Y/n]: " RELOAD_NGX
+        RELOAD_NGX="${RELOAD_NGX:-Y}"
+        if [[ "$RELOAD_NGX" =~ ^[Yy]$ ]]; then
+          systemctl reload nginx && info "[${DOMAIN}] nginx reloaded."
+        else
+          info "[${DOMAIN}] Skipped nginx reload."
+        fi
+      else
+        err "[${DOMAIN}] nginx -t FAILED — not reloading."
+      fi
+    else
+      warn "[${DOMAIN}] Failed to copy nginx backup (skipping)."
+    fi
+  else
+    warn "[${DOMAIN}] No nginx backup found at ${NGINX_BAK} (skipping)."
+  fi
+
+  # 3) Restore DB
+  if [[ -f "$DB_DUMP" ]]; then
+    info "[${DOMAIN}] Restoring DB from ${DB_DUMP} (you will be prompted for ${DB_USER}'s password)..."
+    set -o pipefail
+    if zcat "$DB_DUMP" | mysql -u "$DB_USER" -p "$DB_NAME"; then
+      info "[${DOMAIN}] Database restored."
+    else
+      err "[${DOMAIN}] Database restore FAILED."
+      set +o pipefail
+      return 1
+    fi
+    set +o pipefail
+  else
+    err "[${DOMAIN}] Missing DB dump: ${DB_DUMP}"
+    return 1
+  fi
+
+  info "---- RESTORE completed for ${DOMAIN} ✅ ----"
+}
+
+# --- Menus ---
 echo
-info "==== Backup Summary (${RUN_TS}) ===="
-if [[ ${#FAILED[@]} -eq 0 ]]; then
-  info "All selected backups completed successfully. 🎉"
-else
-  err "Backups failed for: ${FAILED[*]}"
+echo "What would you like to do?"
+echo "1) Perform a backup (default)"
+echo "2) Restore a specific version"
+echo "3) Both: backup then restore"
+read -rp "Enter choice [1-3, default 1]: " ACT_CHOICE
+ACT_CHOICE="${ACT_CHOICE:-1}"
+
+# Backup selection (if applicable)
+DOMAINS=()
+if [[ "$ACT_CHOICE" == "1" || "$ACT_CHOICE" == "3" ]]; then
+  echo
+  echo "Select what to back up:"
+  echo "1) ALL projects (default)"
+  i=2
+  for d in "${PROJECTS[@]}"; do
+    echo "${i}) ${d}"
+    ((i++))
+  done
+  read -rp "Enter choice [1-$(( ${#PROJECTS[@]} + 1 )) , default 1]: " CHOICE
+  CHOICE="${CHOICE:-1}"
+
+  if [[ "$CHOICE" == "1" ]]; then
+    DOMAINS=("${PROJECTS[@]}")
+  else
+    index=$((CHOICE - 2))  # because 1 is "All"
+    if [[ $index -lt 0 || $index -ge ${#PROJECTS[@]} ]]; then
+      err "Invalid backup choice."
+      exit 1
+    fi
+    DOMAINS=("${PROJECTS[$index]}")
+  fi
+
+  info "Selected for BACKUP: ${DOMAINS[*]}"
+  FAILED_B=()
+  for d in "${DOMAINS[@]}"; do
+    if ! backup_domain "$d"; then
+      FAILED_B+=("$d")
+    fi
+  done
+  if [[ ${#FAILED_B[@]} -gt 0 ]]; then
+    err "Backup failures: ${FAILED_B[*]}"
+  else
+    info "Backups completed successfully."
+  fi
 fi
-info "Run log: ${RUN_LOG}"
-info "Latest log symlink: ${LOG_DIR}/latest.log"
-info "==== WP Backup Run Finished ===="
+
+# Restore selection (if applicable)
+if [[ "$ACT_CHOICE" == "2" || "$ACT_CHOICE" == "3" ]]; then
+  echo
+  echo "Select a project to RESTORE (restore is one domain at a time):"
+  i=1
+  for d in "${PROJECTS[@]}"; do
+    echo "${i}) ${d}"
+    ((i++))
+  done
+  read -rp "Enter choice [1-${#PROJECTS[@]}]: " RCHOICE
+  rindex=$((RCHOICE - 1))
+  if [[ -z "${RCHOICE:-}" || $rindex -lt 0 || $rindex -ge ${#PROJECTS[@]} ]]; then
+    err "Invalid restore choice."
+    exit 1
+  fi
+  RESTORE_DOMAIN="${PROJECTS[$rindex]}"
+
+  if ! restore_domain "$RESTORE_DOMAIN"; then
+    err "Restore failed for ${RESTORE_DOMAIN}"
+    exit 1
+  fi
+fi
+
+echo
+info "==== Run finished. Log: ${RUN_LOG} | Latest: ${LOG_DIR}/latest.log ===="
