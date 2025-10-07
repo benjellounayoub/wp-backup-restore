@@ -1,54 +1,46 @@
 #!/bin/bash
-# WordPress multi-project BACKUP & RESTORE with logging + retention + php-fpm restart
-# Backups:
-#   Files -> /var/www/save/<domain>/<YYYY-MM-DD>/<TS>_files.tar.gz
-#   DB    -> /var/www/save/<domain>/<YYYY-MM-DD>/db_<TS>.sql.gz
-#   Nginx -> copied to same dated folder
-# Logs:
-#   /var/log/wp-backup/run_<timestamp>.log  (+ latest.log symlink)
-#
-# Retention:
-#   - Backups older than BACKUP_RETENTION_DAYS are removed per domain
-#   - Logs older than LOG_RETENTION_DAYS are removed
-#
-# Requirements: Debian/Ubuntu-like (nginx, mariadb/mysql, gzip, tar, tee)
-# NOTE: Run as root (sudo). The script prompts securely for DB passwords on dump/restore.
+# WordPress multi-project BACKUP & RESTORE
+# - Config is sourced from /etc/wp-backup-restore/settings.conf (or ./settings.conf as fallback)
+# - Backs up files (tar.gz), nginx vhost, and DB (sql.gz)
+# - Restores a selected version (files + DB + vhost), restarts php-fpm
+# - Retention: backups > N days removed per domain; logs > N days removed
+# - DATE_DIR uses YYYYMMDD
 
 set -Euo pipefail
 
-# --- Require root ---
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run this script with sudo (root). Example: sudo $0"
+# --- Require bash 4+ for associative arrays ---
+if [[ -z "${BASH_VERSINFO:-}" || ${BASH_VERSINFO[0]} -lt 4 ]]; then
+  echo "This script requires bash 4 or newer." >&2
   exit 1
 fi
 
-# --- Config ---
-WEBROOT_BASE="/var/www/html"
-SAVE_BASE="/var/www/save"
-NGINX_BASE="/etc/nginx/sites-available"
-LOG_DIR="/var/log/wp-backup"
-WEB_OWNERSHIP="www-data:www-data"   # adjust if needed (e.g., nginx:nginx)
+# --- Require root ---
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run this script with sudo (root). Example: sudo $0" >&2
+  exit 1
+fi
 
-# Retention (days)
-BACKUP_RETENTION_DAYS=30
-LOG_RETENTION_DAYS=30
+# --- Load config ---
+CONFIG_CANDIDATES=( "/etc/wp-backup-restore/settings.conf" "./settings.conf" )
+CONFIG_LOADED=""
+for C in "${CONFIG_CANDIDATES[@]}"; do
+  if [[ -f "$C" ]]; then
+    # shellcheck disable=SC1090
+    source "$C"
+    CONFIG_LOADED="$C"
+    break
+  fi
+done
+if [[ -z "$CONFIG_LOADED" ]]; then
+  echo "Config not found. Create /etc/wp-backup-restore/settings.conf (see example)." >&2
+  exit 1
+fi
 
-RUN_TS="$(date +%Y%m%d%H%M%S)"
-DATE_DIR="$(date +%Y-%m-%d)"
-RUN_LOG="${LOG_DIR}/run_${RUN_TS}.log"
-
-# Projects (edit here to add/remove)
-PROJECTS=(
-  "domain1.com"
-  "domain2.com"
-  "domain3.ca"
-  "domain4.ca"
-  "domain5.ca"
-  "domain6.com"
-)
-
-# --- Prepare logging ---
+# --- Logging prep (from config) ---
 mkdir -p "$LOG_DIR"
+RUN_TS="$(date +%Y%m%d%H%M%S)"
+DATE_DIR="$(date +%Y%m%d)"     # << per your request: YYYYMMDD
+RUN_LOG="${LOG_DIR}/run_${RUN_TS}.log"
 touch "$RUN_LOG"
 ln -sfn "$RUN_LOG" "${LOG_DIR}/latest.log"
 exec > >(tee -a "$RUN_LOG") 2>&1
@@ -60,38 +52,71 @@ warn() { log WARN "$@"; }
 err()  { log ERROR "$@"; }
 
 info "==== WP Backup/Restore Run Started: ${RUN_TS} ===="
+info "Loaded config: ${CONFIG_LOADED}"
 
-# --- Helpers ---
-get_db_creds() {
-  # $1 = DOMAIN, returns DB_USER, DB_NAME (globals)
+# --- Helpers ---------------------------------------------------------------
+
+resolve_path() {
+  # $1 = base, $2 = maybe-absolute
+  local base="$1" node="$2"
+  if [[ "$node" == /* ]]; then
+    printf '%s\n' "$node"
+  else
+    printf '%s/%s\n' "$base" "$node"
+  fi
+}
+
+get_paths_for_domain() {
+  # $1 = DOMAIN
   local DOMAIN="$1"
-  local WP_CONFIG="${WEBROOT_BASE}/${DOMAIN}/wp-config.php"
+  local web="${PROJECT_WEB[$DOMAIN]}"
+  local vhost="${PROJECT_VHOST[$DOMAIN]}"
 
+  WEBROOT_PATH="$(resolve_path "$WEBROOT_BASE" "$web")"
+  NGINX_CONF_PATH="$(resolve_path "$NGINX_BASE" "$vhost")"
+  BACKUP_ROOT="${SAVE_BASE}/${DOMAIN}/${DATE_DIR}"
+}
+
+get_db_creds() {
+  # $1 = DOMAIN, returns globals: DB_NAME, DB_USER
+  local DOMAIN="$1"
+  get_paths_for_domain "$DOMAIN"
+
+  # Prefer config values if present
+  DB_NAME="${PROJECT_DB[$DOMAIN]:-}"
+  DB_USER="${PROJECT_DB_USER[$DOMAIN]:-}"
+
+  local WP_CONFIG="${WEBROOT_PATH}/wp-config.php"
   if [[ ! -f "$WP_CONFIG" ]]; then
     err "[${DOMAIN}] wp-config.php not found at ${WP_CONFIG}"
-    return 1
+    # Still allow restore of files/vhost even if config missing
   fi
 
-  DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")" || true
-  DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")" || true
+  # Auto-detect missing pieces from wp-config.php
+  if [[ -z "${DB_NAME:-}" && -f "$WP_CONFIG" ]]; then
+    DB_NAME="$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME',\s*'\([^']*\)'.*/\1/")" || true
+  fi
+  if [[ -z "${DB_USER:-}" && -f "$WP_CONFIG" ]]; then
+    DB_USER="$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER',\s*'\([^']*\)'.*/\1/")" || true
+  fi
 
+  # Prompt if still missing
   if [[ -z "${DB_NAME:-}" ]]; then
-    read -rp "[${DOMAIN}] Couldn't detect DB_NAME. Enter DB name: " DB_NAME
+    read -rp "[${DOMAIN}] Enter DB name: " DB_NAME
   fi
   if [[ -z "${DB_USER:-}" ]]; then
-    read -rp "[${DOMAIN}] Couldn't detect DB_USER. Enter DB user: " DB_USER
+    read -rp "[${DOMAIN}] Enter DB user: " DB_USER
   fi
+
   info "[${DOMAIN}] DB_USER=${DB_USER} DB_NAME=${DB_NAME}"
 }
 
 detect_php_fpm_service() {
-  # Try to find an active php-fpm service (php8.3-fpm, php8.2-fpm, php7.4-fpm, php-fpm, etc.)
   local svc=""
   svc="$(systemctl list-units --type=service --state=running | awk '/php.*-fpm\.service/ {print $1; exit}')" || true
   if [[ -z "$svc" ]]; then
     svc="$(systemctl list-unit-files | awk '/php.*-fpm\.service/ {print $1; exit}')" || true
   fi
-  # Fallback generic name seen on some distros
   if [[ -z "$svc" ]] && systemctl list-unit-files | grep -q "^php-fpm\.service"; then
     svc="php-fpm.service"
   fi
@@ -102,96 +127,92 @@ restart_php_fpm() {
   local svc
   svc="$(detect_php_fpm_service)"
   if [[ -n "$svc" ]]; then
-    info "Restarting php-fpm service: $svc"
+    info "Restarting php-fpm: $svc"
     if systemctl restart "$svc"; then
-      info "php-fpm restarted: $svc"
+      info "php-fpm restarted."
     else
-      warn "systemctl restart failed for $svc. Trying 'service' fallback."
+      warn "systemctl restart failed for $svc; trying 'service' fallback."
       if command -v service >/dev/null 2>&1 && service "${svc%.service}" restart; then
-        info "php-fpm restarted via service: ${svc%.service}"
+        info "php-fpm restarted via service."
       else
-        err "Failed to restart php-fpm. Please restart it manually."
+        err "Failed to restart php-fpm; restart manually."
       fi
     fi
   else
-    warn "No php-fpm service detected. Skipping restart."
+    warn "No php-fpm service detected."
   fi
 }
 
 purge_old_backups() {
   # $1 = DOMAIN, $2 = days
-  local DOMAIN="$1"
-  local DAYS="$2"
-  local ROOT="${SAVE_BASE}/${DOMAIN}"
-  [[ -d "$ROOT" ]] || return 0
-
-  info "[${DOMAIN}] Purging backup folders older than ${DAYS} days under ${ROOT} ..."
-  # Only remove first-level dated directories older than N days
-  find "$ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$DAYS" -print -exec rm -rf {} +
+  local DOMAIN="$1" DAYS="$2"
+  local root="${SAVE_BASE}/${DOMAIN}"
+  [[ -d "$root" ]] || return 0
+  info "[${DOMAIN}] Purging backups older than ${DAYS} days in ${root} ..."
+  find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$DAYS" -print -exec rm -rf {} +
 }
 
 purge_old_logs() {
-  # $1 = days
   local DAYS="$1"
   [[ -d "$LOG_DIR" ]] || return 0
-  info "Purging run logs older than ${DAYS} days in ${LOG_DIR} ..."
-  # Keep latest.log symlink; delete only run_*.log files older than N days
+  info "Purging logs older than ${DAYS} days in ${LOG_DIR} ..."
   find "$LOG_DIR" -type f -name "run_*.log" -mtime +"$DAYS" -print -delete
 }
 
+# --- Core ops --------------------------------------------------------------
+
 backup_domain () {
-  # $1 = DOMAIN
   local DOMAIN="$1"
-  local WEBROOT="${WEBROOT_BASE}/${DOMAIN}"
-  local NGINX_CONF="${NGINX_BASE}/${DOMAIN}"
-  local BACKUP_DIR="${SAVE_BASE}/${DOMAIN}/${DATE_DIR}"
-  local TS_DETAIL="$(date +%Y%m%d%H%M%S)"
+  get_paths_for_domain "$DOMAIN"
+  local TS_DETAIL
+  TS_DETAIL="$(date +%Y%m%d%H%M%S)"
   local STATUS=0
 
-  info "---- Starting BACKUP for ${DOMAIN} ----"
-  info "Paths: WEBROOT=${WEBROOT}  NGINX=${NGINX_CONF}  BACKUP_DIR=${BACKUP_DIR}"
-  mkdir -p "${BACKUP_DIR}" || { err "Failed to create ${BACKUP_DIR}"; return 1; }
+  info "---- BACKUP ${DOMAIN} ----"
+  info "WEBROOT=${WEBROOT_PATH}  NGINX=${NGINX_CONF_PATH}  SAVE=${BACKUP_ROOT}"
+
+  mkdir -p "$BACKUP_ROOT" || { err "Failed to create ${BACKUP_ROOT}"; return 1; }
 
   get_db_creds "$DOMAIN" || STATUS=1
 
   # 1) Files
-  if [[ -d "$WEBROOT" ]]; then
+  if [[ -d "$WEBROOT_PATH" ]]; then
     info "[${DOMAIN}] Archiving files..."
-    if tar czf "${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz" -C "${WEBROOT_BASE}" "${DOMAIN}"; then
-      info "[${DOMAIN}] Files -> ${BACKUP_DIR}/${TS_DETAIL}_files.tar.gz"
+    if tar czf "${BACKUP_ROOT}/${TS_DETAIL}_files.tar.gz" -C "$(dirname "$WEBROOT_PATH")" "$(basename "$WEBROOT_PATH")"; then
+      info "[${DOMAIN}] Files -> ${BACKUP_ROOT}/${TS_DETAIL}_files.tar.gz"
     else
       err  "[${DOMAIN}] Files archive FAILED"
       STATUS=1
     fi
   else
-    warn "[${DOMAIN}] Webroot not found at ${WEBROOT} (skipping files)"
+    warn "[${DOMAIN}] Webroot not found at ${WEBROOT_PATH} (skipping files)"
     STATUS=1
   fi
 
   # 2) Nginx
-  if [[ -f "$NGINX_CONF" ]]; then
-    if cp "$NGINX_CONF" "$BACKUP_DIR/"; then
-      info "[${DOMAIN}] Nginx -> ${BACKUP_DIR}/$(basename "$NGINX_CONF")"
+  if [[ -f "$NGINX_CONF_PATH" ]]; then
+    if cp "$NGINX_CONF_PATH" "$BACKUP_ROOT/"; then
+      info "[${DOMAIN}] Nginx -> ${BACKUP_ROOT}/$(basename "$NGINX_CONF_PATH")"
     else
       err  "[${DOMAIN}] Nginx copy FAILED"
       STATUS=1
     fi
   else
-    warn "[${DOMAIN}] Nginx conf not found at ${NGINX_CONF} (skipping)"
+    warn "[${DOMAIN}] Nginx conf not found at ${NGINX_CONF_PATH} (skipping)"
   fi
 
   # 3) DB
   info "[${DOMAIN}] Dumping DB (you will be prompted for ${DB_USER}'s password)..."
   set -o pipefail
-  if mysqldump --add-drop-table -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"; then
-    info "[${DOMAIN}] DB -> ${BACKUP_DIR}/db_${TS_DETAIL}.sql.gz"
+  if mysqldump --add-drop-table -u "$DB_USER" -p "$DB_NAME" | gzip > "${BACKUP_ROOT}/db_${TS_DETAIL}.sql.gz"; then
+    info "[${DOMAIN}] DB -> ${BACKUP_ROOT}/db_${TS_DETAIL}.sql.gz"
   else
     err  "[${DOMAIN}] DB dump FAILED"
     STATUS=1
   fi
   set +o pipefail
 
-  # 4) Per-domain retention cleanup
+  # 4) Retention
   purge_old_backups "$DOMAIN" "$BACKUP_RETENTION_DAYS"
 
   if [[ $STATUS -eq 0 ]]; then
@@ -199,28 +220,21 @@ backup_domain () {
   else
     err  "---- BACKUP completed with errors for ${DOMAIN} ❌ ----"
   fi
-
   return $STATUS
 }
 
 list_versions() {
-  # $1 = DOMAIN
-  # Prints indexed list of versions (TS + path), newest first.
-  # Populates global arrays: V_TS[], V_DB[], V_FILES[], V_DIR[]
   local DOMAIN="$1"
-  local ROOT="${SAVE_BASE}/${DOMAIN}"
+  local root="${SAVE_BASE}/${DOMAIN}"
 
-  V_TS=()
-  V_DB=()
-  V_FILES=()
-  V_DIR=()
+  V_TS=() V_DB=() V_FILES=() V_DIR=()
 
-  if [[ ! -d "$ROOT" ]]; then
-    warn "[${DOMAIN}] No backups found under ${ROOT}"
+  if [[ ! -d "$root" ]]; then
+    warn "[${DOMAIN}] No backups found under ${root}"
     return 1
   fi
 
-  mapfile -t DB_FILES < <(find "$ROOT" -type f -name "db_*.sql.gz" | sort -r)
+  mapfile -t DB_FILES < <(find "$root" -type f -name "db_*.sql.gz" | sort -r)
   if [[ ${#DB_FILES[@]} -eq 0 ]]; then
     warn "[${DOMAIN}] No DB dumps found."
     return 1
@@ -234,10 +248,7 @@ list_versions() {
     files_tar="${dir}/${ts}_files.tar.gz"
     [[ -f "$files_tar" ]] || continue
 
-    V_TS+=("$ts")
-    V_DB+=("$db")
-    V_FILES+=("$files_tar")
-    V_DIR+=("$dir")
+    V_TS+=("$ts"); V_DB+=("$db"); V_FILES+=("$files_tar"); V_DIR+=("$dir")
   done
 
   if [[ ${#V_TS[@]} -eq 0 ]]; then
@@ -259,16 +270,12 @@ list_versions() {
 }
 
 restore_domain () {
-  # $1 = DOMAIN
   local DOMAIN="$1"
-  local WEBROOT="${WEBROOT_BASE}/${DOMAIN}"
-  local NGINX_CONF="${NGINX_BASE}/${DOMAIN}"
-
-  info "---- Starting RESTORE for ${DOMAIN} ----"
+  get_paths_for_domain "$DOMAIN"
+  info "---- RESTORE ${DOMAIN} ----"
 
   get_db_creds "$DOMAIN" || return 1
 
-  # Choose version
   if ! list_versions "$DOMAIN"; then
     err "[${DOMAIN}] No restorable versions."
     return 1
@@ -286,7 +293,7 @@ restore_domain () {
   local DB_DUMP="${V_DB[$idx]}"
   local FILES_TAR="${V_FILES[$idx]}"
   local BACKUP_DIR="${V_DIR[$idx]}"
-  local NGINX_BAK="${BACKUP_DIR}/${DOMAIN}"
+  local NGINX_BAK="${BACKUP_DIR}/$(basename "$NGINX_CONF_PATH")"
 
   echo
   warn "You are about to RESTORE ${DOMAIN} to version ${SEL_TS}."
@@ -294,19 +301,19 @@ restore_domain () {
   read -rp "Type 'RESTORE' to proceed: " CONFIRM
   [[ "$CONFIRM" == "RESTORE" ]] || { info "Restore cancelled."; return 1; }
 
-  # Pre-restore snapshot (safety)
+  # Pre-restore snapshot
   info "[${DOMAIN}] Creating pre-restore BACKUP snapshot..."
   if ! backup_domain "$DOMAIN"; then
-    warn "[${DOMAIN}] Pre-restore backup encountered issues (continuing)."
+    warn "[${DOMAIN}] Pre-restore backup had issues (continuing)."
   fi
 
-  # 1) Restore files
+  # 1) Files
   if [[ -f "$FILES_TAR" ]]; then
     info "[${DOMAIN}] Restoring files from ${FILES_TAR} ..."
-    if tar xzf "$FILES_TAR" -C "$WEBROOT_BASE"; then
+    if tar xzf "$FILES_TAR" -C "$(dirname "$WEBROOT_PATH")"; then
       info "[${DOMAIN}] Files restored."
       if id -u www-data >/dev/null 2>&1; then
-        chown -R "$WEB_OWNERSHIP" "${WEBROOT_BASE}/${DOMAIN}" || warn "[${DOMAIN}] chown failed (check ownership manually)."
+        chown -R "$WEB_OWNERSHIP" "$WEBROOT_PATH" || warn "[${DOMAIN}] chown failed; check ownership."
       fi
     else
       err "[${DOMAIN}] File restore FAILED."
@@ -317,11 +324,11 @@ restore_domain () {
     return 1
   fi
 
-  # 2) Restore nginx config (if present)
+  # 2) Nginx
   if [[ -f "$NGINX_BAK" ]]; then
     info "[${DOMAIN}] Restoring nginx site config..."
-    if cp "$NGINX_BAK" "$NGINX_CONF"; then
-      info "[${DOMAIN}] Nginx config restored to ${NGINX_CONF}"
+    if cp "$NGINX_BAK" "$NGINX_CONF_PATH"; then
+      info "[${DOMAIN}] Nginx config -> ${NGINX_CONF_PATH}"
       if nginx -t; then
         read -rp "Reload nginx now? [Y/n]: " RELOAD_NGX
         RELOAD_NGX="${RELOAD_NGX:-Y}"
@@ -340,7 +347,7 @@ restore_domain () {
     warn "[${DOMAIN}] No nginx backup found at ${NGINX_BAK} (skipping)."
   fi
 
-  # 3) Restore DB
+  # 3) DB
   if [[ -f "$DB_DUMP" ]]; then
     info "[${DOMAIN}] Restoring DB from ${DB_DUMP} (you will be prompted for ${DB_USER}'s password)..."
     set -o pipefail
@@ -357,13 +364,14 @@ restore_domain () {
     return 1
   fi
 
-  # 4) Restart php-fpm (auto-detected service)
+  # 4) Restart php-fpm
   restart_php_fpm
 
   info "---- RESTORE completed for ${DOMAIN} ✅ ----"
 }
 
-# --- Menus ---
+# --- Menus -----------------------------------------------------------------
+
 echo
 echo "What would you like to do?"
 echo "1) Perform a backup (default)"
@@ -414,7 +422,7 @@ fi
 # Restore selection (if applicable)
 if [[ "$ACT_CHOICE" == "2" || "$ACT_CHOICE" == "3" ]]; then
   echo
-  echo "Select a project to RESTORE (restore is one domain at a time):"
+  echo "Select a project to RESTORE (one domain at a time):"
   i=1
   for d in "${PROJECTS[@]}"; do
     echo "${i}) ${d}"
@@ -434,7 +442,7 @@ if [[ "$ACT_CHOICE" == "2" || "$ACT_CHOICE" == "3" ]]; then
   fi
 fi
 
-# --- Log rotation (always run once per script invocation) ---
+# --- Log rotation (always) ---
 purge_old_logs "$LOG_RETENTION_DAYS"
 
 echo
