@@ -39,7 +39,7 @@ The project includes an **install script** that automates setup for you.
 cd /tmp
 git clone https://github.com/benjellounayoub/wp-backup-restore.git
 cd wp-backup-restore
-sudo bash install.sh --https --branch develop
+sudo bash install.sh --https --branch master
 ```
 
 This will:
